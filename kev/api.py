@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Literal, Union
 from pydantic import BaseModel, Field, model_validator
 
+SERIALIZER_REVISION = "kev_systemone_v1"
 JSONContent = Union[str, dict, list, int, float, bool, None]
 MAX_OPTIONS = 255
 

@@ -506,7 +506,15 @@ def test_serve_models_card_reports_the_state_limit(tiny_model, monkeypatch):
     from fastapi.testclient import TestClient
     from kev import serve
     tok, model = tiny_model
-    s = serve.Server(SimpleNamespace(release_date=lambda: "2026-01-01", requested="tiny", meta=SimpleNamespace(base="tiny", lora=0)), tok, model, "cpu")
+    checkpoint = SimpleNamespace(
+        release_date=lambda: "2026-01-01", requested="tiny",
+        meta=SimpleNamespace(base="tiny", lora=0),
+        preflight=lambda tok, model: {
+            "model_id": None, "model_revision": None,
+            "tokenizer_revision": None, "native_window": None,
+            "preflight_errors": ["test fixture has no provenance"],
+        })
+    s = serve.Server(checkpoint, tok, model, "cpu")
     try:
         monkeypatch.setattr(serve, "server", lambda: s)
         with TestClient(serve.app) as client:

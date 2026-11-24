@@ -16,6 +16,7 @@ import the data or suite modules at import time.
     ck.meta.temperature                             # the calibration the checkpoint carries
 """
 import datetime
+import hashlib
 import importlib.util
 import json
 import os
@@ -28,6 +29,12 @@ import torch
 from .model import DecisionModel, is_hybrid, load_tokenizer, pad_id
 
 HUB_ID = re.compile(r"[\w.-]+/[\w.-]+(@[\w.-]+)?")
+HUB_COMMIT = re.compile(r"[0-9a-f]{40}")
+TOKENIZER_ASSETS = (
+    "added_tokens.json", "merges.txt", "sentencepiece.bpe.model",
+    "special_tokens_map.json", "spiece.model", "tokenizer.json",
+    "tokenizer.model", "tokenizer_config.json", "vocab.json", "vocab.txt",
+)
 
 
 def is_hub_id(run):
@@ -42,6 +49,56 @@ def resolve_run(run):
     from huggingface_hub import snapshot_download
     repo, _, revision = str(run).partition("@")
     return snapshot_download(repo, revision=revision or None, allow_patterns=["*.json", "*.safetensors", "*.pt", "*.txt", "*.jinja"])
+
+
+def _file_sha256(path: str | Path) -> str:
+    """
+    Вычисляет SHA-256 файла без загрузки целого файла в память.
+
+    Parameters:
+        path (str | Path): Путь к файлу.
+
+    Returns:
+        str: SHA-256 в шестнадцатеричном виде.
+
+    Fallbacks:
+        Не предусмотрены.
+    """
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_native_window(model: object) -> int | None:
+    """
+    Возвращает native context window из конфигурации загруженного backbone.
+
+    Parameters:
+        model (object): Фактически загруженная модель Kev.
+
+    Returns:
+        int | None: Подтверждённое окно или None.
+
+    Fallbacks:
+        Проверяет общие имена поля конфигурации и не использует HTTP admission limit.
+    """
+    backbone = getattr(model, "lm", None)
+    config = getattr(backbone, "config", None)
+    if config is None:
+        config = getattr(backbone, "args", None)
+    if config is None:
+        config = getattr(model, "config", None)
+    if callable(getattr(config, "get_text_config", None)):
+        config = config.get_text_config()
+    for name in ("max_position_embeddings", "max_seq_len", "seq_length",
+                 "n_positions"):
+        value = (config.get(name) if isinstance(config, dict)
+                 else getattr(config, name, None))
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
 
 
 @dataclass
@@ -166,10 +223,132 @@ def fused_available():
 
 
 class Checkpoint:
-    def __init__(self, run):
+    def __init__(self, run: str | Path) -> None:
         self.requested = str(run)                    # what the caller asked for (a Hub id stays a Hub id in labels)
         self.path = resolve_run(run)
         self.meta = read_meta(self.path)
+        self.model_id = None
+        self.model_revision = None
+        if is_hub_id(self.requested):
+            self.model_id = self.requested.partition("@")[0]
+            snapshot = Path(self.path).name
+            if HUB_COMMIT.fullmatch(snapshot):
+                self.model_revision = snapshot
+
+    def tokenizer_revision(self, tok: object) -> str | None:
+        """
+        Возвращает immutable Hub SHA или SHA-256 файлов загруженного tokenizer.
+
+        Parameters:
+            tok (object): Фактически загруженный tokenizer.
+
+        Returns:
+            str | None: Hub commit или SHA-256 набора tokenizer assets.
+
+        Fallbacks:
+            Для локального tokenizer вычисляет fingerprint файлов; при отсутствии доказательства возвращает None.
+        """
+        commit = getattr(tok, "_commit_hash", None)
+        init = getattr(tok, "init_kwargs", {})
+        if not commit and isinstance(init, dict):
+            commit = init.get("_commit_hash")
+        if isinstance(commit, str) and HUB_COMMIT.fullmatch(commit):
+            return commit
+
+        tokenizer_path = Path(str(getattr(tok, "name_or_path", "")))
+        if tokenizer_path.is_dir():
+            assets = [tokenizer_path / name for name in TOKENIZER_ASSETS
+                      if (tokenizer_path / name).is_file()]
+            if assets:
+                digest = hashlib.sha256()
+                for asset in assets:
+                    digest.update(
+                        f"{asset.name}\0{asset.stat().st_size}\0".encode("utf-8"))
+                    with asset.open("rb") as stream:
+                        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                return digest.hexdigest()
+
+        if isinstance(self.meta.base_revision, str) and HUB_COMMIT.fullmatch(
+                self.meta.base_revision):
+            return self.meta.base_revision
+        return None
+
+    def checkpoint_fingerprint(self) -> str:
+        """
+        Возвращает SHA-256 содержимого локального checkpoint.
+
+        Returns:
+            str: Fingerprint весов и head.pt.
+
+        Fallbacks:
+            Не предусмотрены.
+        """
+        digest = hashlib.sha256()
+        for name, value in (
+                ("head.pt", _file_sha256(self.file("head.pt"))),
+                ("weights", self.weights_sha256())):
+            digest.update(f"{name}:{value}\n".encode("utf-8"))
+        return digest.hexdigest()
+
+    def preflight(self, tok: object, model: object) -> dict[str, object]:
+        """
+        Собирает доказуемую metadata загруженного checkpoint для preflight-контракта.
+
+        Parameters:
+            tok (object): Фактически загруженный tokenizer.
+            model (object): Фактически загруженная модель.
+
+        Returns:
+            dict[str, object]: Поля происхождения checkpoint и список ошибок доказательства.
+
+        Fallbacks:
+            Неизвестные обязательные значения возвращает как None и описывает в preflight_errors.
+        """
+        errors = []
+        metadata = self.meta.extra.get("preflight", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        model_id = self.model_id
+        model_revision = self.model_revision
+        if model_id is None:
+            model_id = metadata.get("model_id")
+            model_revision = metadata.get("model_revision")
+            recorded_revision = (
+                isinstance(model_revision, str)
+                and (HUB_COMMIT.fullmatch(model_revision)
+                     or re.fullmatch(r"sha256:[0-9a-f]{64}", model_revision)))
+            if not isinstance(model_id, str) or not model_id or not recorded_revision:
+                try:
+                    fingerprint = self.checkpoint_fingerprint()
+                except (OSError, ValueError) as error:
+                    errors.append(
+                        f"model_id/model_revision: local checkpoint fingerprint failed: {error}")
+                    model_id = model_revision = None
+                else:
+                    model_id = f"checkpoint-sha256:{fingerprint}"
+                    model_revision = f"sha256:{fingerprint}"
+        elif model_revision is None:
+            errors.append(
+                "model_revision: resolved Hub snapshot path does not contain an immutable commit SHA")
+
+        tokenizer_revision = self.tokenizer_revision(tok)
+        if tokenizer_revision is None:
+            errors.append(
+                "tokenizer_revision: tokenizer has no resolved Hub SHA or readable tokenizer assets")
+
+        native_window = metadata.get("native_window")
+        if (not isinstance(native_window, int) or isinstance(native_window, bool)
+                or native_window <= 0):
+            native_window = _model_native_window(model)
+        if native_window is None:
+            errors.append(
+                "native_window: checkpoint metadata and loaded backbone config do not prove a context window")
+
+        return {"model_id": model_id, "model_revision": model_revision,
+                "tokenizer_revision": tokenizer_revision,
+                "native_window": native_window, "preflight_errors": errors}
 
     def file(self, name):
         return Path(self.path) / name
@@ -193,10 +372,11 @@ class Checkpoint:
 
     def weights_sha256(self):
         """What a run's provenance pins: the adapter file's sha256, or for full weights the sha256 over every shard's."""
-        from .suite import digest   # lazy: the Space vendors this module without kev/suite.py
-        if not self.full: return digest(self.file("adapter_model.safetensors"))
-        import hashlib
-        return hashlib.sha256("".join(f"{p.name}:{digest(p)}\n" for p in self.shards()).encode()).hexdigest()
+        if not self.full:
+            return _file_sha256(self.file("adapter_model.safetensors"))
+        return hashlib.sha256("".join(
+            f"{path.name}:{_file_sha256(path)}\n" for path in self.shards()
+        ).encode()).hexdigest()
 
     def release_date(self):
         """ISO date for the TypeSafe model card: the Hub commit date for a Hub checkpoint (falls back to the cached file's

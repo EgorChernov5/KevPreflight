@@ -271,6 +271,24 @@ Objects and arrays are converted to labeled text. Delimiter-like strings in user
 | `POST` | `/v1/systemone/permute` | Run one Choice question with different option orders (`n_perm` 1 to 64, default 6) |
 | `POST` | `/v1/systemone/separate` | Run each question in its own forward pass |
 
+The loaded model cards keep the existing `run`, `base`, `device`, `backend`, `dtype`, `temperature`, `max_state_tokens` and `truncate_states` fields. They also expose the `semantic-validation-preflight-v1` contract:
+
+| Field | Meaning |
+|---|---|
+| `model_id` | Hub repository id, or a content-addressed id for a local checkpoint |
+| `model_revision` | Resolved immutable Hub commit, or the local checkpoint's SHA-256 fingerprint |
+| `tokenizer_revision` | Resolved tokenizer Hub commit, or SHA-256 of the tokenizer assets that were loaded |
+| `native_window` | Context window proved by checkpoint metadata or the loaded backbone config; this is independent of the server's `max_state_tokens` admission limit |
+| `prompt_contract` | Version of Kev's pointer prompt and delimiter layout |
+| `serializer_revision` | Version of the System One request to Kev record serializer |
+| `special_tokens` | Delimiters used by `encode`, in encoding order |
+| `prompt_reserve` | Number of delimiter types reserved by the prompt contract |
+| `device`, `dtype`, `backend` | Runtime values from the loaded server |
+| `backend_contract` | HTTP scoring contract implemented by the server |
+| `preflight_errors` | Empty when every required value is proved; otherwise diagnostics for fields returned as `null` |
+
+`native_window` is never inferred from `max_state_tokens`. A checkpoint without verifiable metadata returns `null` for the unknown field and describes the missing evidence in `preflight_errors`.
+
 A request may carry any number of questions. The server runs them a token budget at a time (one maximal row of 16,384 tokens per forward pass, counting the cached document once per question in that pass), so memory does not grow with the question count and the answers do not depend on the split. Every response carries an `x-typesafe-request-id` header. The server binds to `127.0.0.1` (`--host 0.0.0.0` to accept other machines) and is open by default; set `KEV_API_KEY` to require `Authorization: Bearer <key>` on `/v1/*`, as the TypeSafe clients always send it.
 
 | Variable | Effect |

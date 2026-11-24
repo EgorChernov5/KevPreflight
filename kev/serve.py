@@ -19,10 +19,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from .api import SystemOneRequest, to_record, to_answers, output_tokens, with_date_facts
+from .api import SERIALIZER_REVISION, SystemOneRequest, to_record, to_answers, output_tokens, with_date_facts
 from .checkpoint import Checkpoint, LoadOptions, fused_available, is_hub_id
 from .device import default_device, empty_cache, out_of_memory, sync
-from .model import SERVE_MAX_STATE, ContextOverflow, admit
+from .model import PROMPT_CONTRACT, PROMPT_RESERVE, SERVE_MAX_STATE, SPECIAL, ContextOverflow, admit
 
 PREFIX_CACHE_SIZE = int(os.environ.get("KEV_PREFIX_CACHE", "4"))          # states kept (KV + DeltaNet states; attention-only backbones also the state's hidden states); 0 disables
 PREFIX_MIN_TOKENS = os.environ.get("KEV_PREFIX_MIN_TOKENS")               # states shorter than this are not cached; default = the model's prefix_min_tokens (0 for hybrid backbones and MLX, 384 for attention-only torch models)
@@ -33,6 +33,8 @@ TRUNCATE_STATES = os.environ.get("KEV_TRUNCATE_STATES", "0") == "1"    # unset =
 API_KEY = os.environ.get("KEV_API_KEY")                                  # unset = open server; set = require Authorization: Bearer <key>, as the TypeSafe clients always send
 MAX_BATCH = 64                                                           # requests the model thread takes at once (kev.cuda_graphs splits them to fit its buffers)
 MODEL_NAMES = ("kev-latest", "jev-latest")                               # both names serve this checkpoint; jev-latest is the TypeSafe SDK default model, so an unconfigured client works
+PREFLIGHT_CONTRACT_VERSION = "semantic-validation-preflight-v1"
+BACKEND_CONTRACT = "kev.http.v1.systemone"
 
 
 @dataclass
@@ -296,15 +298,20 @@ def truncation_marks(body, part):
 
 
 @app.get("/v1/models")
-def models():
-    """One TypeSafe model card (name, description, release_date) per accepted model name, plus the Kev serving details
-    a client may ignore: the run, the base, the device, the backend and precision, the temperature, prefix-cache stats."""
+def models() -> dict[str, list[dict[str, object]]]:
+    """Возвращает карточку загруженной модели для каждого поддерживаемого алиаса."""
     s = server()
     ck, meta = s.checkpoint, s.checkpoint.meta
+    preflight = ck.preflight(s.tok, s.model)
     card = {"description": f"Kev pointer head on {meta.base}, serving {ck.requested} at temperature {s.model.head.temperature:.2f}",
             "release_date": s.release_date,
             "run": ck.requested, "base": meta.base, "lora": meta.lora, "device": s.device, "backend": s.model.backend, "dtype": s.model.dtype,
             "temperature": s.model.head.temperature, "max_state_tokens": SERVE_MAX_STATE, "truncate_states": s.truncate_states,
+            "preflight_contract_version": PREFLIGHT_CONTRACT_VERSION,
+            **preflight, "prompt_contract": PROMPT_CONTRACT,
+            "serializer_revision": SERIALIZER_REVISION,
+            "special_tokens": list(SPECIAL), "prompt_reserve": PROMPT_RESERVE,
+            "backend_contract": BACKEND_CONTRACT,
             "cuda_graphs": graphs.stats() if (graphs := getattr(s.model, "graphs", None)) else None,
             "prefix_cache": {"size": s.prefix_cache.size, "min_state_tokens": s.prefix_cache.min_tokens, "max_tokens": s.prefix_cache.max_tokens, "hits": s.prefix_cache.hits,
                              "misses": s.prefix_cache.misses, "cached_states": len(s.prefix_cache.entries), "oom_retries": s.prefix_cache.oom_retries},
